@@ -436,19 +436,21 @@ template("blueos_toolchain") {
     }
 
     tool("rust_dylib") {
+      default_output_extension = ".so"
+      if (current_os == "mac" || current_os == "ios") {
+        default_output_extension = ".dylib"
+      }
       depfile = "{{target_out_dir}}/{{target_output_name}}.d"
       mapfile = "{{target_out_dir}}/{{target_output_name}}.map"
       clippy_rspfile = "{{target_out_dir}}/{{target_output_name}}.clippy_rsp"
-      outfile = "{{output_dir}}/lib{{target_output_name}}.so"
-
+      outfile = "{{output_dir}}/lib{{target_output_name}}{{output_extension}}"
+      _identity =
+          "-Clink-arg=-Wl,-soname,lib{{target_output_name}}{{output_extension}}"
+      if (current_os == "mac" || current_os == "ios") {
+        _identity = "-Clink-arg=-Wl,-install_name,@rpath/lib{{target_output_name}}{{output_extension}}"
+      }
       clippy_command = "{{rustenv}} ${clippy_driver} --crate-name {{crate_name}} --crate-type {{crate_type}} {{rustflags}} ${clippy_lint_flags} {{source}} {{externs}} {{rustdeps}} -o ${outfile}.clippy"
-
-      gen_clippy_rspfile_command =
-          " && echo '${clippy_command}' > ${clippy_rspfile}"
-
-      rustc_command = "{{rustenv}} ${rustc} --crate-name {{crate_name}} --crate-type {{crate_type}} --emit=dep-info=$depfile,link {{rustflags}} -o ${outfile} {{source}} {{externs}} {{rustdeps}} -Clink-arg=${link_map_opt}${mapfile}"
-
-      command = "${rustc_command} ${gen_clippy_rspfile_command}"
+      command = "{{rustenv}} ${rustc} --crate-name {{crate_name}} --crate-type {{crate_type}} --emit=dep-info=$depfile,link {{rustflags}} -o ${outfile} {{source}} {{externs}} {{rustdeps}} ${_identity} -Clink-arg=${link_map_opt}${mapfile} && echo '${clippy_command}' > ${clippy_rspfile}"
       description = "RUST ${outfile}"
       outputs = [
         outfile,

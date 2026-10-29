@@ -49,6 +49,7 @@ fn missing_prerequisite() -> Option<String> {
         "templates/cargo_crate.gni",
         "scripts/resolve_cargo_aliases.py",
         "scripts/run_build_script.py",
+        "scripts/run_rustc.py",
         "scripts/action_helpers.py",
     ] {
         if !build.join(relative).is_file() {
@@ -122,6 +123,7 @@ fn native_bindings_preserve_aliases_domains_and_build_script_outputs() {
         "templates/cargo_crate.gni",
         "scripts/resolve_cargo_aliases.py",
         "scripts/run_build_script.py",
+        "scripts/run_rustc.py",
         "scripts/action_helpers.py",
     ] {
         write(
@@ -173,15 +175,15 @@ host_build_ctx.build_config_cflags_cc = [ "-DGN_HOST_CXXFLAGS" ]
  tool("stamp") { command = "touch {{output}}" }
  tool("action") {}
  tool("rust_rlib") {
- command = "env {{rustenv}} @RUSTC@ --crate-name {{crate_name}} {{source}} --crate-type=rlib {{externs}} {{rustdeps}} {{rustflags}} -o {{output}}"
+ command = "env {{rustenv}} python3 ../build/scripts/run_rustc.py @RUSTC@ --crate-name {{crate_name}} {{source}} --crate-type=rlib {{externs}} {{rustdeps}} {{rustflags}} -o {{output}}"
  outputs = [ "{{target_out_dir}}/lib{{target_output_name}}.rlib" ]
  }
  tool("rust_macro") {
- command = "env {{rustenv}} @RUSTC@ --crate-name {{crate_name}} {{source}} --crate-type=proc-macro {{externs}} {{rustdeps}} {{rustflags}} -o {{output}}"
+ command = "env {{rustenv}} python3 ../build/scripts/run_rustc.py @RUSTC@ --crate-name {{crate_name}} {{source}} --crate-type=proc-macro {{externs}} {{rustdeps}} {{rustflags}} -o {{output}}"
  outputs = [ "{{target_out_dir}}/lib{{target_output_name}}.@DYLIB@" ]
  }
  tool("rust_bin") {
- command = "env {{rustenv}} @RUSTC@ --crate-name {{crate_name}} {{source}} --crate-type=bin {{externs}} {{rustdeps}} {{rustflags}} -o {{output}}"
+ command = "env {{rustenv}} python3 ../build/scripts/run_rustc.py @RUSTC@ --crate-name {{crate_name}} {{source}} --crate-type=bin {{externs}} {{rustdeps}} {{rustflags}} -o {{output}}"
  outputs = [ "{{root_out_dir}}/bin/{{target_output_name}}" ]
  }
 }

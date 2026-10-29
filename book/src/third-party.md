@@ -54,13 +54,14 @@ Targets can depend on those rules, for example by adding `//external/rust:unwind
 
 ### Procedural macros
 
-Declare a procedural macro crate in the same way as a regular dependency. For
-example, `external/rust/BUILD.gn` declares `paste`:
+Declare a procedural macro crate with `crate_type = "proc-macro"`. For example,
+`external/rust/BUILD.gn` declares `paste`:
 
 ```gn
 cargo_spec("paste") {
   package = "paste"
   version = "=1.0.15"
+  crate_type = "proc-macro"
   default_features = false
 }
 ```

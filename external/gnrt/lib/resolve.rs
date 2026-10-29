@@ -1026,10 +1026,35 @@ fn resolve_instances(
                 edge.instance = space.dependency().instance(edge.context);
             }
             let deps::BuildTargets {
-                lib_target,
+                mut lib_target,
                 bin_targets,
                 build_script,
             } = deps::get_build_targets(&package, config)?;
+            for declaration in &direct {
+                if let Some(library) = lib_target.as_mut() {
+                    library
+                        .validate_output_type(declaration.crate_type)
+                        .with_context(|| {
+                            format!(
+                                "declaration {} requests crate_type={} for {} {}",
+                                declaration.label,
+                                declaration.crate_type,
+                                package.name(),
+                                package.version()
+                            )
+                        })?;
+                    library.output_types.push(declaration.crate_type);
+                    library.output_types.sort();
+                    library.output_types.dedup();
+                } else {
+                    ensure!(
+                        declaration.crate_type == deps::LibType::Rlib,
+                        "declaration {} requests a library output, but {} has no library",
+                        declaration.label,
+                        package.name()
+                    );
+                }
+            }
             let source = external_source(package);
             let path = crate_gn_path(root, package.manifest_path().as_str())?;
             crates.insert(
@@ -1079,7 +1104,80 @@ fn resolve_instances(
             );
         }
     }
+    select_dependency_outputs(&mut crates)?;
+    for info in crates.values() {
+        if let Some(library) = &info.package.lib_target {
+            library.validate_output_types().with_context(|| {
+                format!(
+                    "selecting library output for {} {} in {} declared by {}",
+                    info.package.package_name,
+                    info.package.version,
+                    info.instance,
+                    info.package.declared_by.join(", ")
+                )
+            })?;
+        }
+    }
     Ok(crates)
+}
+
+fn select_dependency_outputs(crates: &mut BTreeMap<String, CrateInfo>) -> Result<()> {
+    let identities: BTreeMap<_, _> = crates
+        .iter()
+        .map(|(key, info)| {
+            (
+                (
+                    info.instance.clone(),
+                    info.package.package_name.clone(),
+                    info.package.version.clone(),
+                ),
+                key.clone(),
+            )
+        })
+        .collect();
+    let mut selections: BTreeMap<String, BTreeSet<deps::LibType>> = BTreeMap::new();
+    for info in crates.values() {
+        for edge in info
+            .package
+            .dependencies
+            .iter()
+            .chain(&info.package.build_dependencies)
+        {
+            let key = identities
+                .get(&(
+                    edge.instance.clone(),
+                    edge.package_name.clone(),
+                    edge.version.clone(),
+                ))
+                .with_context(|| {
+                    format!(
+                        "missing resolved dependency {} -> {} in {}",
+                        info.package.package_name, edge.package_name, edge.instance
+                    )
+                })?;
+            let library = crates[key].package.lib_target.as_ref().with_context(|| {
+                format!(
+                    "dependency {} -> {} has no library",
+                    info.package.package_name, edge.package_name
+                )
+            })?;
+            let kind = library.default_type();
+            selections.entry(key.clone()).or_default().insert(kind);
+        }
+    }
+    for (key, types) in selections {
+        let library = crates
+            .get_mut(&key)
+            .with_context(|| format!("missing selected crate {key}"))?
+            .package
+            .lib_target
+            .as_mut()
+            .with_context(|| format!("selected crate {key} has no library"))?;
+        library.output_types.extend(types);
+        library.output_types.sort();
+        library.output_types.dedup();
+    }
+    Ok(())
 }
 
 /// Verifies that every dependency binds to its resolved scope and context.
@@ -1653,6 +1751,7 @@ mod tests {
             label: format!("//test:{package}"),
             package: package.to_owned(),
             version: version.to_owned(),
+            crate_type: deps::LibType::Rlib,
             features: features
                 .iter()
                 .map(|f| ConfigurableValue::Value(f.to_string()))
@@ -1780,6 +1879,117 @@ weakonly = ["shared?/weak"]
         command.other_options(vec!["--offline".to_owned()]);
         let graph = command.exec().unwrap().build_graph().unwrap();
         (fixture, graph, declarations)
+    }
+
+    #[test]
+    fn proc_macro_roots_require_explicit_gn_output_types() {
+        let (fixture, _, mut declarations) = instance_fixture(false);
+        let root = fixture.path().canonicalize().unwrap();
+        fs::write(
+            root.join("library/Cargo.toml"),
+            "[package]\nname = \"library\"\nversion = \"1.0.0\"\nedition = \"2021\"\n[lib]\nproc-macro = true\n[features]\na = []\nb = []\n",
+        )
+        .unwrap();
+        let mut metadata = guppy::MetadataCommand::new();
+        metadata.cargo_path(env!("CARGO"));
+        metadata.current_dir(&root);
+        metadata.other_options(vec!["--offline".to_owned()]);
+        let graph = metadata.exec().unwrap().build_graph().unwrap();
+        let error =
+            resolve_instances(&graph, &declarations, &root, &BuildConfig::default()).unwrap_err();
+        assert!(format!("{error:#}").contains("set crate_type = \"proc-macro\""));
+        for item in &mut declarations.cargo {
+            let Declaration::Crate(declaration) = item else {
+                unreachable!()
+            };
+            declaration.crate_type = deps::LibType::ProcMacro;
+        }
+        let crates =
+            resolve_instances(&graph, &declarations, &root, &BuildConfig::default()).unwrap();
+        assert_eq!(crates.len(), 2);
+        for info in crates.values() {
+            assert_eq!(info.context, ResolutionContext::Host);
+            assert_eq!(
+                info.package.lib_target.as_ref().unwrap().artifact_types(),
+                vec![deps::LibType::ProcMacro]
+            );
+        }
+        let Declaration::Crate(declaration) = &mut declarations.cargo[0] else {
+            unreachable!()
+        };
+        declaration.crate_type = deps::LibType::Dylib;
+        assert!(resolve_instances(&graph, &declarations, &root, &BuildConfig::default()).is_err());
+    }
+
+    #[test]
+    fn artifact_requests_share_features_and_preserve_manifest_library_name() {
+        let (fixture, _, mut declarations) = instance_fixture(false);
+        let root = fixture.path().canonicalize().unwrap();
+        let manifest = fixture.path().join("library/Cargo.toml");
+        fs::write(
+            &manifest,
+            format!(
+                "{}\n[lib]\nname = \"custom_library\"\ncrate-type = [\"dylib\"]\n",
+                fs::read_to_string(&manifest).unwrap()
+            ),
+        )
+        .unwrap();
+        for (item, kind) in declarations
+            .cargo
+            .iter_mut()
+            .zip([deps::LibType::Rlib, deps::LibType::Dylib])
+        {
+            let Declaration::Crate(declaration) = item else {
+                unreachable!()
+            };
+            declaration.isolation = Isolation::None;
+            declaration.crate_type = kind;
+        }
+        let mut metadata = guppy::MetadataCommand::new();
+        metadata.cargo_path(env!("CARGO"));
+        metadata.current_dir(fixture.path());
+        metadata.other_options(vec!["--offline".to_owned()]);
+        let graph = metadata.exec().unwrap().build_graph().unwrap();
+        let error =
+            resolve_instances(&graph, &declarations, &root, &BuildConfig::default()).unwrap_err();
+        assert!(format!("{error:#}").contains("multiple crate types for one resolved instance"));
+        for item in &mut declarations.cargo {
+            let Declaration::Crate(declaration) = item else {
+                unreachable!()
+            };
+            declaration.crate_type = deps::LibType::Rlib;
+        }
+        let crates =
+            resolve_instances(&graph, &declarations, &root, &BuildConfig::default()).unwrap();
+        let roots = crates
+            .values()
+            .filter(|info| info.package.package_name == "library")
+            .collect::<Vec<_>>();
+        assert_eq!(roots.len(), 2);
+        for info in roots {
+            let library = info.package.lib_target.as_ref().unwrap();
+            assert_eq!(library.name, "custom_library");
+            assert!(!library.is_proc_macro);
+            assert_eq!(library.artifact_types(), vec![deps::LibType::Rlib]);
+            assert_eq!(info.package.declared_by.len(), 2);
+            let features = if info.context == ResolutionContext::Target {
+                &info.package.target_features
+            } else {
+                &info.package.host_features
+            };
+            let names = features
+                .iter()
+                .flat_map(|group| group.features.iter())
+                .collect::<BTreeSet<_>>();
+            assert!(names.contains(&"a".to_owned()) && names.contains(&"b".to_owned()));
+        }
+        let Declaration::Crate(declaration) = &mut declarations.cargo[0] else {
+            unreachable!()
+        };
+        declaration.crate_type = deps::LibType::ProcMacro;
+        let error =
+            resolve_instances(&graph, &declarations, &root, &BuildConfig::default()).unwrap_err();
+        assert!(format!("{error:#}").contains("ordinary library, not a procedural macro"));
     }
 
     #[test]
@@ -2541,6 +2751,7 @@ weakonly = ["shared?/weak"]
             serde.default_features = false;
             let mut consumer = crate_decl("consumer", "=1.0.0", &[]);
             consumer.label = "//test:consumer".to_owned();
+            consumer.crate_type = deps::LibType::ProcMacro;
             let declarations = DeclarationGroups {
                 cargo: vec![Declaration::Crate(serde), Declaration::Crate(consumer)],
                 gn: Vec::new(),

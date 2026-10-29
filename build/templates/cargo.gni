@@ -79,6 +79,18 @@ template("cargo_spec") {
     _tag = invoker.tag
   }
 
+  _crate_type = "rlib"
+  if (defined(invoker.crate_type)) {
+    assert(filter_include([ invoker.crate_type ],
+                          [
+                            "rlib",
+                            "dylib",
+                            "proc-macro",
+                          ]) != [],
+           "cargo_spec crate_type must be rlib, dylib, or proc-macro")
+    _crate_type = invoker.crate_type
+  }
+
   _needs_sync = gnrt_mode != "collect"
   foreach(_entry, gnrt_crate_index.crates) {
     if (_entry.proxy == _label) {
@@ -108,6 +120,7 @@ template("cargo_spec") {
           label = _label
           package = invoker.package
           version = invoker.version
+          crate_type = _crate_type
           features = _features
           rustflags = _rustflags
           default_features = _default_features

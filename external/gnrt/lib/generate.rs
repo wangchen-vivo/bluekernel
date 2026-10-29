@@ -22,6 +22,7 @@
 use crate::collect::{ConfigurableValue, Declaration, DeclarationGroups};
 use crate::config::BuildConfig;
 use crate::crates::{Epoch, NormalizedName};
+use crate::deps::LibType;
 use crate::gn_condition::{self, ConditionExpr};
 use crate::package::{Dependency, FeatureGroup, Package, ResolutionContext};
 use crate::paths::GnrtPaths;
@@ -35,16 +36,27 @@ use anyhow::{bail, ensure, Context, Result};
 use semver::Version;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-/// The Handlebars render context for one crate's `BUILD.gn`.
+/// The Handlebars render context for a source directory's `BUILD.gn`.
 ///
 /// Built from the resolved `package::Package` and `selector`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CrateBuildFile {
-    /// One entry per lib target and per bin target of the crate.
+    /// Resolved instances whose rules share this source directory.
+    pub instances: Vec<CrateInstance>,
+}
+
+/// Artifact and build-script rules belonging to one resolved crate instance.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CrateInstance {
+    /// The GN recipe name identifying this instance.
+    pub name: String,
+    /// One entry per library artifact or executable.
     pub targets: Vec<Target>,
+    /// The shared package script, or `None` when the instance has no script.
+    pub build_script: Option<Target>,
 }
 
 /// A single GN target generated for a crate.
@@ -54,8 +66,10 @@ pub struct Target {
     pub name: String,
     /// The Rust crate name without the compilation instance suffix.
     pub crate_name: String,
-    /// `rlib`, `proc-macro`, or `bin`.
+    /// The rustc library or executable output type.
     pub crate_type: String,
+    /// The filename stem unique to this artifact.
+    pub output_name: String,
     /// Cargo Host/Target resolution context for this crate.
     pub context: String,
     /// The crate root source file as a project-root-relative GN path.
@@ -193,8 +207,8 @@ pub struct Alias {
     pub label: String,
 }
 
-/// Generated GN labels keyed by feature instance, package name, and version.
-type LabelMap = BTreeMap<(String, String, Version), String>;
+/// Rust labels and library names keyed by instance, package name, and version.
+type LabelMap = BTreeMap<(String, String, Version), (String, String)>;
 
 /// The host toolchain label that qualifies host-context dependency edges.
 ///
@@ -286,26 +300,37 @@ pub fn generate_to(
             crate_info.package.package_name,
             crate_info.package.version
         );
-        let build_file =
-            build_crate_build_file(crate_info, &config, &labels, &host_toolchain, paths)?;
+        let instance = build_crate_instance(crate_info, &config, &labels, &host_toolchain, paths)?;
         let relative_dir = std::path::PathBuf::from(crate_info.rule_dir.trim_start_matches("//"));
-        build_files
+        let file = build_files
             .entry(relative_dir)
             .or_insert_with(|| CrateBuildFile {
-                targets: Vec::new(),
-            })
-            .targets
-            .extend(build_file.targets);
+                instances: Vec::new(),
+            });
+        file.instances.push(instance);
     }
 
     let mut files = Vec::with_capacity(build_files.len().saturating_add(1));
     for (relative_dir, mut build_file) in build_files {
-        build_file.targets.sort_by(|a, b| a.name.cmp(&b.name));
+        build_file.instances.sort_by(|a, b| a.name.cmp(&b.name));
+        for instance in &mut build_file.instances {
+            instance.targets.sort_by(|a, b| a.name.cmp(&b.name));
+        }
         ensure!(
             build_file
-                .targets
+                .instances
                 .windows(2)
                 .all(|pair| pair[0].name != pair[1].name),
+            "duplicate crate instance in {}",
+            relative_dir.display()
+        );
+        let mut target_names = BTreeSet::new();
+        ensure!(
+            build_file
+                .instances
+                .iter()
+                .flat_map(|instance| &instance.targets)
+                .all(|target| target_names.insert(&target.name)),
             "duplicate GN target in {}",
             relative_dir.display()
         );
@@ -343,52 +368,62 @@ fn crate_index(
     declarations: &DeclarationGroups,
     resolved: &BTreeMap<String, CrateInfo>,
 ) -> Result<CrateIndex> {
-    let mut labels_by_proxy: BTreeMap<&str, CrateIndexEntry> = BTreeMap::new();
-    for crate_info in resolved.values() {
-        for proxy in &crate_info.package.declared_by {
-            let entry = labels_by_proxy
-                .entry(proxy)
-                .or_insert_with(|| CrateIndexEntry {
-                    proxy: proxy.clone(),
-                    target_label: None,
-                    host_label: None,
-                    crate_type: crate_info
-                        .package
-                        .lib_target
-                        .as_ref()
-                        .map(|target| target.lib_type.to_string())
-                        .unwrap_or_else(|| "bin".to_owned()),
-                });
-            let slot = match crate_info.context {
-                ResolutionContext::Target => &mut entry.target_label,
-                ResolutionContext::Host => &mut entry.host_label,
-            };
-            let label = crate_label(crate_info);
-            ensure!(
-                slot.as_ref().map_or(true, |previous| previous == &label),
-                "declaration {proxy} has conflicting {:?} bindings",
-                crate_info.context
-            );
-            *slot = Some(label);
-        }
-    }
     let mut crates = Vec::new();
     for declaration in &declarations.cargo {
         let Declaration::Crate(declaration) = declaration else {
             continue;
         };
-        let entry = labels_by_proxy
-            .remove(declaration.label.as_str())
-            .with_context(|| {
-                format!(
-                    "declaration {} ({}) has no resolved crate",
-                    declaration.label, declaration.package
-                )
-            })?;
+        let mut entry = CrateIndexEntry {
+            proxy: declaration.label.clone(),
+            target_label: None,
+            host_label: None,
+            crate_type: String::new(),
+        };
+        for info in resolved
+            .values()
+            .filter(|info| info.package.declared_by.contains(&declaration.label))
+        {
+            let kind = match &info.package.lib_target {
+                Some(library) => {
+                    library.validate_output_type(declaration.crate_type)?;
+                    Some(declaration.crate_type)
+                }
+                None => None,
+            };
+            let name = kind
+                .map(|kind| kind.to_string())
+                .unwrap_or_else(|| "bin".to_owned());
+            ensure!(
+                entry.crate_type.is_empty() || entry.crate_type == name,
+                "declaration {} has conflicting artifact kinds",
+                declaration.label
+            );
+            entry.crate_type = name;
+            let label = kind
+                .map(|kind| artifact_label(info, kind))
+                .unwrap_or_else(|| crate_label(info));
+            let slot = match info.context {
+                ResolutionContext::Target => &mut entry.target_label,
+                ResolutionContext::Host => &mut entry.host_label,
+            };
+            ensure!(
+                slot.as_ref().map_or(true, |old| old == &label),
+                "declaration {} has conflicting {:?} bindings",
+                declaration.label,
+                info.context
+            );
+            *slot = Some(label);
+        }
+        ensure!(
+            !entry.crate_type.is_empty(),
+            "declaration {} ({}) has no resolved crate",
+            declaration.label,
+            declaration.package
+        );
         crates.push(entry);
     }
-    crates.sort_by(|lhs, rhs| lhs.proxy.cmp(&rhs.proxy));
-    Ok(CrateIndex { version: 1, crates })
+    crates.sort_by(|a, b| a.proxy.cmp(&b.proxy));
+    Ok(CrateIndex { version: 2, crates })
 }
 
 /// Serializes the proxy index to `path`.
@@ -398,20 +433,18 @@ fn write_crate_index_file(path: &Path, index: &CrateIndex) -> Result<()> {
     std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
 }
 
-/// Builds the render model for one crate.
-fn build_crate_build_file(
+/// Builds the artifact and script rules for one resolved instance.
+fn build_crate_instance(
     crate_info: &CrateInfo,
     config: &BuildConfig,
     labels: &LabelMap,
     host_toolchain: &str,
     paths: &dyn GnrtPaths,
-) -> Result<CrateBuildFile> {
+) -> Result<CrateInstance> {
     let package = &crate_info.package;
     let mut targets = Vec::with_capacity(package.bin_targets.len().saturating_add(1));
 
-    // A package has a single build script. Attach it to the lib target only:
-    // `cargo_crate` creates one build-script action per target, so attaching it
-    // to several targets would have them collide on the same action outputs.
+    // Every artifact shares the build script of its resolved recipe.
     let build = build_script(package, config, paths)?;
     let context = crate_info.context;
     let context_name = match context {
@@ -426,54 +459,70 @@ fn build_crate_build_file(
         features.extend(declared_groups(&package.declared_conditions)?);
     }
 
+    let recipe_name = instance_target_name(crate_info, &library_name(crate_info));
     if let Some(lib_target) = &package.lib_target {
-        let crate_name = NormalizedName::from_crate_name(&package.package_name).to_string();
-        let name = instance_target_name(crate_info, &crate_name);
-        targets.push(Target {
-            rustc_metadata: format!("{}:{name}", crate_info.rule_dir),
-            name,
-            crate_name,
-            crate_type: lib_target.lib_type.to_string(),
-            context: context_name.to_owned(),
-            crate_root: gn_path(paths, &lib_target.root)?,
-            edition: edition(package, config),
-            version: package.version.to_string(),
-            epoch: Epoch::from_version(&package.version).to_version_string(),
-            rustenv: rustenv(package)?,
-            rustflags: rustflag_groups(&package.rustflags),
-            manifest_dir: crate_info.path.clone(),
-            features: features.clone(),
-            deps: dependency_groups(package.dependencies.iter(), labels, host_toolchain, context)?,
-            build_deps: dependency_groups(
-                package.build_dependencies.iter(),
-                labels,
-                host_toolchain,
-                context,
-            )?,
-            aliased_deps: alias_groups(
-                package.dependencies.iter(),
-                labels,
-                host_toolchain,
-                context,
-            )?,
-            build_aliased_deps: alias_groups(
-                package.build_dependencies.iter(),
-                labels,
-                host_toolchain,
-                context,
-            )?,
-            build_root: build.root.clone(),
-            build_sources: build.sources.clone(),
-            build_script_inputs: build.inputs.clone(),
-            build_script_outputs: build.outputs.clone(),
-            build_script_env: feature_env_groups(&features),
-        });
+        lib_target.validate_output_types().with_context(|| {
+            format!(
+                "selecting library output for {} {}",
+                package.package_name, package.version
+            )
+        })?;
+        for kind in lib_target.artifact_types() {
+            let crate_name = lib_target.name.clone();
+            let name = artifact_target_name(crate_info, kind);
+            targets.push(Target {
+                output_name: artifact_output_name(crate_info, kind),
+                rustc_metadata: format!("{}:{recipe_name}", crate_info.rule_dir),
+                name,
+                crate_name,
+                crate_type: kind.to_string(),
+                context: context_name.to_owned(),
+                crate_root: gn_path(paths, &lib_target.root)?,
+                edition: edition(package, config),
+                version: package.version.to_string(),
+                epoch: Epoch::from_version(&package.version).to_version_string(),
+                rustenv: rustenv(package)?,
+                rustflags: rustflag_groups(&package.rustflags),
+                manifest_dir: crate_info.path.clone(),
+                features: features.clone(),
+                deps: dependency_groups(
+                    package.dependencies.iter(),
+                    labels,
+                    host_toolchain,
+                    context,
+                )?,
+                build_deps: dependency_groups(
+                    package.build_dependencies.iter(),
+                    labels,
+                    host_toolchain,
+                    context,
+                )?,
+                aliased_deps: alias_groups(
+                    package.dependencies.iter(),
+                    labels,
+                    host_toolchain,
+                    context,
+                )?,
+                build_aliased_deps: alias_groups(
+                    package.build_dependencies.iter(),
+                    labels,
+                    host_toolchain,
+                    context,
+                )?,
+                build_root: build.root.clone(),
+                build_sources: build.sources.clone(),
+                build_script_inputs: build.inputs.clone(),
+                build_script_outputs: build.outputs.clone(),
+                build_script_env: feature_env_groups(&features),
+            });
+        }
     }
 
     for bin in &package.bin_targets {
         let crate_name = NormalizedName::from_crate_name(&bin.name).to_string();
         let name = instance_target_name(crate_info, &format!("{crate_name}__bin"));
         targets.push(Target {
+            output_name: name.clone(),
             rustc_metadata: format!("{}:{name}", crate_info.rule_dir),
             name,
             crate_name,
@@ -496,42 +545,98 @@ fn build_crate_build_file(
             )?,
             aliased_deps: Vec::new(),
             build_aliased_deps: Vec::new(),
-            build_root: None,
-            build_sources: Vec::new(),
-            build_script_inputs: Vec::new(),
-            build_script_outputs: Vec::new(),
-            build_script_env: Vec::new(),
+            build_root: build.root.clone(),
+            build_sources: build.sources.clone(),
+            build_script_inputs: build.inputs.clone(),
+            build_script_outputs: build.outputs.clone(),
+            build_script_env: feature_env_groups(&features),
         });
     }
 
     if targets.is_empty() {
         bail!("package {} has no lib or bin target", package.package_name);
     }
-    Ok(CrateBuildFile { targets })
+    let build_script = if build.root.is_some() {
+        let mut script = targets[0].clone();
+        script.name = recipe_name.clone();
+        Some(script)
+    } else {
+        None
+    };
+    Ok(CrateInstance {
+        name: recipe_name,
+        targets,
+        build_script,
+    })
 }
 
-/// Maps every resolved crate to its generated GN label.
+/// Maps Rust-compatible instances to their labels and library names.
 fn crate_label_map(context: &SyncContext) -> LabelMap {
-    context
-        .crates
-        .values()
-        .map(|crate_info| {
-            let package = &crate_info.package;
-            let key = (
-                crate_info.instance.clone(),
-                package.package_name.clone(),
-                package.version.clone(),
-            );
-            (key, crate_label(crate_info))
-        })
-        .collect()
+    let mut labels = LabelMap::new();
+    for info in context.crates.values() {
+        if let Some(library) = &info.package.lib_target {
+            if let Some(kind) = library.rust_type() {
+                labels.insert(
+                    (
+                        info.instance.clone(),
+                        info.package.package_name.clone(),
+                        info.package.version.clone(),
+                    ),
+                    (artifact_label(info, kind), library.name.clone()),
+                );
+            }
+        }
+    }
+    labels
 }
 
-/// The generated GN label of a resolved crate.
-fn crate_label(crate_info: &CrateInfo) -> String {
-    let crate_name = NormalizedName::from_crate_name(&crate_info.package.package_name).to_string();
-    let target = instance_target_name(crate_info, &crate_name);
-    format!("{}:{target}", crate_info.rule_dir)
+fn library_name(info: &CrateInfo) -> String {
+    info.package
+        .lib_target
+        .as_ref()
+        .map(|lib| lib.name.clone())
+        .unwrap_or_else(|| NormalizedName::from_crate_name(&info.package.package_name).to_string())
+}
+
+/// Returns the generated label of the preferred Rust representation.
+fn crate_label(info: &CrateInfo) -> String {
+    let kind = info
+        .package
+        .lib_target
+        .as_ref()
+        .map(|lib| lib.rust_type().unwrap_or_else(|| lib.default_type()));
+    kind.map(|kind| artifact_label(info, kind))
+        .unwrap_or_else(|| {
+            format!(
+                "{}:{}",
+                info.rule_dir,
+                instance_target_name(info, &library_name(info))
+            )
+        })
+}
+
+fn artifact_target_name(info: &CrateInfo, kind: LibType) -> String {
+    let name = instance_target_name(info, &library_name(info));
+    match kind {
+        LibType::Rlib | LibType::ProcMacro => name,
+        _ => format!("{name}__{kind}"),
+    }
+}
+
+fn artifact_label(info: &CrateInfo, kind: LibType) -> String {
+    format!("{}:{}", info.rule_dir, artifact_target_name(info, kind))
+}
+
+fn artifact_output_name(info: &CrateInfo, kind: LibType) -> String {
+    format!(
+        "{}_v{}_{}",
+        artifact_target_name(info, kind),
+        info.package
+            .version
+            .to_string()
+            .replace(['.', '-', '+'], "_"),
+        &format!("{:x}", Sha256::digest(info.rule_dir.as_bytes()))[..12]
+    )
 }
 
 /// Returns a GN target name unique to a compilation instance.
@@ -582,8 +687,19 @@ fn alias_groups<'a>(
 ) -> Result<Vec<CondGroup<Alias>>> {
     let mut grouped: BTreeMap<Option<ConditionExpr>, Vec<Alias>> = BTreeMap::new();
     for edge in edges {
-        let normalized = NormalizedName::from_crate_name(&edge.package_name).to_string();
-        if edge.use_name == normalized {
+        let (_, actual_name) = labels
+            .get(&(
+                edge.instance.clone(),
+                edge.package_name.clone(),
+                edge.version.clone(),
+            ))
+            .with_context(|| {
+                format!(
+                    "no Rust library for dependency {} {}",
+                    edge.package_name, edge.version
+                )
+            })?;
+        if &edge.use_name == actual_name {
             continue;
         }
         grouped
@@ -640,7 +756,7 @@ fn dependency_label(edge: &Dependency, labels: &LabelMap, host_toolchain: &str) 
             edge.package_name.clone(),
             edge.version.clone(),
         ))
-        .cloned()
+        .map(|(label, _)| label.clone())
         .with_context(|| {
             format!(
                 "no generated label for dependency {} {}",
@@ -794,7 +910,10 @@ mod tests {
     fn labels() -> LabelMap {
         BTreeMap::from([(
             (String::new(), "libc".to_owned(), Version::new(1, 0, 0)),
-            "//third_party/libc-1.0.0:libc".to_owned(),
+            (
+                "//third_party/libc-1.0.0:libc".to_owned(),
+                "libc".to_owned(),
+            ),
         )])
     }
 
@@ -873,58 +992,63 @@ mod tests {
     #[test]
     fn render_model_serializes_to_the_template_context() {
         let value = serde_json::to_value(CrateBuildFile {
-            targets: vec![Target {
+            instances: vec![CrateInstance {
                 name: "cfg_if".to_owned(),
-                crate_name: "cfg_if".to_owned(),
-                crate_type: "rlib".to_owned(),
-                context: "target".to_owned(),
-                crate_root: "//third_party/cfg-if-1.0.4/src/lib.rs".to_owned(),
-                edition: "2018".to_owned(),
-                version: "1.0.4".to_owned(),
-                epoch: "1".to_owned(),
-                rustenv: vec!["CARGO_PKG_NAME=cfg-if".to_owned()],
-                rustflags: rustflag_groups(&[
-                    ConfigurableValue::Value("--cfg=custom=\"value with spaces\"".to_owned()),
-                    ConfigurableValue::Conditional {
-                        condition: "board == \"test\"".to_owned(),
-                        values: vec!["--cfg=conditional".to_owned()],
-                    },
-                    ConfigurableValue::Value("-Copt-level=2".to_owned()),
-                    ConfigurableValue::Value("-Copt-level=2".to_owned()),
-                ]),
-                manifest_dir: "//third_party/cfg-if-1.0.4".to_owned(),
-                rustc_metadata: "fixture_cfg_if".to_owned(),
-                features: vec![CondGroup {
-                    cond: None,
-                    items: vec!["std".to_owned()],
-                }],
-                deps: vec![CondGroup {
-                    cond: Some(ConditionExpr::CargoCfg {
-                        context: ResolutionContext::Target,
-                        expression: crate::gn_condition::CfgCondition::Name {
-                            name: "unix".to_owned(),
+                build_script: None,
+                targets: vec![Target {
+                    output_name: "cfg_if".to_owned(),
+                    name: "cfg_if".to_owned(),
+                    crate_name: "cfg_if".to_owned(),
+                    crate_type: "rlib".to_owned(),
+                    context: "target".to_owned(),
+                    crate_root: "//third_party/cfg-if-1.0.4/src/lib.rs".to_owned(),
+                    edition: "2018".to_owned(),
+                    version: "1.0.4".to_owned(),
+                    epoch: "1".to_owned(),
+                    rustenv: vec!["CARGO_PKG_NAME=cfg-if".to_owned()],
+                    rustflags: rustflag_groups(&[
+                        ConfigurableValue::Value("--cfg=custom=\"value with spaces\"".to_owned()),
+                        ConfigurableValue::Conditional {
+                            condition: "board == \"test\"".to_owned(),
+                            values: vec!["--cfg=conditional".to_owned()],
                         },
-                    }),
-                    items: vec!["//third_party/libc-0.2.189:libc".to_owned()],
-                }],
-                build_deps: Vec::new(),
-                aliased_deps: vec![CondGroup {
-                    cond: None,
-                    items: vec![Alias {
-                        use_name: "lock_api_crate".to_owned(),
-                        label: "//third_party/lock_api-0.4.14:lock_api".to_owned(),
+                        ConfigurableValue::Value("-Copt-level=2".to_owned()),
+                        ConfigurableValue::Value("-Copt-level=2".to_owned()),
+                    ]),
+                    manifest_dir: "//third_party/cfg-if-1.0.4".to_owned(),
+                    rustc_metadata: "fixture_cfg_if".to_owned(),
+                    features: vec![CondGroup {
+                        cond: None,
+                        items: vec!["std".to_owned()],
                     }],
+                    deps: vec![CondGroup {
+                        cond: Some(ConditionExpr::CargoCfg {
+                            context: ResolutionContext::Target,
+                            expression: crate::gn_condition::CfgCondition::Name {
+                                name: "unix".to_owned(),
+                            },
+                        }),
+                        items: vec!["//third_party/libc-0.2.189:libc".to_owned()],
+                    }],
+                    build_deps: Vec::new(),
+                    aliased_deps: vec![CondGroup {
+                        cond: None,
+                        items: vec![Alias {
+                            use_name: "lock_api_crate".to_owned(),
+                            label: "//third_party/lock_api-0.4.14:lock_api".to_owned(),
+                        }],
+                    }],
+                    build_aliased_deps: Vec::new(),
+                    build_root: None,
+                    build_sources: Vec::new(),
+                    build_script_inputs: Vec::new(),
+                    build_script_outputs: Vec::new(),
+                    build_script_env: Vec::new(),
                 }],
-                build_aliased_deps: Vec::new(),
-                build_root: None,
-                build_sources: Vec::new(),
-                build_script_inputs: Vec::new(),
-                build_script_outputs: Vec::new(),
-                build_script_env: Vec::new(),
             }],
         })
         .unwrap();
-        let target = &value["targets"][0];
+        let target = &value["instances"][0]["targets"][0];
         assert_eq!(target["name"], "cfg_if");
         assert_eq!(target["crate_name"], "cfg_if");
         assert_eq!(target["crate_type"], "rlib");
@@ -987,7 +1111,10 @@ mod tests {
                     a.package_name.clone(),
                     a.version.clone(),
                 ),
-                "//third_party/libc-1.0.0:libc__a".to_owned(),
+                (
+                    "//third_party/libc-1.0.0:libc__a".to_owned(),
+                    "libc".to_owned(),
+                ),
             ),
             (
                 (
@@ -995,7 +1122,10 @@ mod tests {
                     b.package_name.clone(),
                     b.version.clone(),
                 ),
-                "//third_party/libc-1.0.0:libc__b".to_owned(),
+                (
+                    "//third_party/libc-1.0.0:libc__b".to_owned(),
+                    "libc".to_owned(),
+                ),
             ),
         ]);
         assert_ne!(
@@ -1087,6 +1217,7 @@ mod tests {
                 label: "//kernel/driver:libc".to_owned(),
                 package: "libc".to_owned(),
                 version: "1.0.0".to_owned(),
+                crate_type: LibType::Rlib,
                 features: Vec::new(),
                 rustflags: Vec::new(),
                 default_features: true,
@@ -1150,7 +1281,7 @@ mod tests {
             crate_label(&shared),
             "//third_party/libc-1.0.0:libc_variant_host"
         );
-        assert_eq!(index.version, 1);
+        assert_eq!(index.version, 2);
         assert_eq!(index.crates.len(), 1);
         assert_eq!(index.crates[0].proxy, "//kernel/driver:libc");
         assert_eq!(

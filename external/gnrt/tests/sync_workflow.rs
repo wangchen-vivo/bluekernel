@@ -468,7 +468,7 @@ group("host_metadata") {{
     fixture.write("sync-input.txt", "original settings\n");
     assert_success(&fixture.sync(&["--all"]));
     let index = fixture.index();
-    assert_eq!(index["version"], 1);
+    assert_eq!(index["version"], 2);
     let state: Value = serde_json::from_slice(
         &fs::read(fixture.root().join("third_party/gnrt_sync_state.json")).unwrap(),
     )

@@ -641,7 +641,12 @@ mod tests {
                 dependencies: vec![],
                 build_dependencies: vec![],
                 dependency_kinds: std::collections::HashMap::new(),
-                lib_target: Some(deps::LibTarget { root: lib_file, lib_type: deps::LibType::Rlib }),
+                lib_target: Some(deps::LibTarget {
+                    root: lib_file,
+                    name: "test_crate".to_owned(),
+                    is_proc_macro: false,
+                    output_types: vec![deps::LibType::Rlib],
+                }),
                 bin_targets: vec![],
                 build_script: None,
                 group: crate::group::Group::Safe,

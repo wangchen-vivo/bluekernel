@@ -21,7 +21,7 @@ use guppy::{
 };
 use itertools::Itertools;
 pub use semver::Version;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fmt::{self, Display},
@@ -166,9 +166,13 @@ pub struct PerKindInfo {
 pub struct LibTarget {
     /// The absolute path of the lib target's `lib.rs`.
     pub root: PathBuf,
-    /// The type of the lib target. This is "rlib" for normal dependencies and
-    /// "proc-macro" for proc macros.
-    pub lib_type: LibType,
+    /// The library target name from Cargo metadata.
+    pub name: String,
+    /// Whether the library is a procedural macro.
+    pub is_proc_macro: bool,
+    /// The outputs selected by declarations and Rust dependencies.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub output_types: Vec<LibType>,
 }
 
 /// A binary provided by a package.
@@ -181,58 +185,72 @@ pub struct BinTarget {
 }
 
 /// The type of lib target. Only includes types supported by this tool.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LibType {
     /// A normal Rust rlib library.
     Rlib,
+    /// A Rust shared library with crate metadata.
+    Dylib,
     /// A procedural macro.
     ProcMacro,
 }
 
-impl LibType {
-    fn from_crate_types(crate_types: &[String]) -> Result<Self> {
-        const RLIB_CRATE_TYPES: [&str; 3] = [
-            // Naturally "rlib" maps to `LibType::Rlib`.
-            "rlib",
-            // https://doc.rust-lang.org/nightly/reference/linkage.html#r-link.lib
-            // says:
-            //
-            //     > The purpose of this generic lib option is to generate
-            //     > the “compiler recommended” style of library.
-            //
-            // For Chromium this means `Rlib`.
-            "lib",
-            // Crates are rarely cdylibs. The example encountered so far aims to expose a C API to
-            // other code. In a Chromium context, we don't want to build that as a dylib for a
-            // couple of reasons:
-            // * rust_shared_library does not work on Mac. rustc does not know how to export the
-            //   __llvm_profile_raw_version symbol.
-            // * even if it did work, this might require us to distribute extra binaries
-            //   (.so/.dylib etc.)
-            // For the only case we've had so far, it makes more sense to build the code as a
-            // static^H^H^Hrlib library which we can then link into downstream binaries.
-            "cdylib",
-        ];
-        for rlib_crate_type in RLIB_CRATE_TYPES.iter() {
-            if crate_types.iter().any(|x| *x == *rlib_crate_type) {
-                return Ok(LibType::Rlib);
-            }
+impl LibTarget {
+    /// Validates the declared output against Cargo's procedural-macro status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the declaration and Cargo metadata disagree on
+    /// whether this library is a procedural macro.
+    pub(crate) fn validate_output_type(&self, declared: LibType) -> Result<()> {
+        match (self.is_proc_macro, declared) {
+            (true, LibType::ProcMacro) | (false, LibType::Rlib | LibType::Dylib) => Ok(()),
+            (true, _) => bail!(
+                "Cargo target is a procedural macro; set crate_type = \"proc-macro\""
+            ),
+            (false, _) => bail!("Cargo target is an ordinary library, not a procedural macro"),
         }
+    }
 
-        // All the other
-        // [crate types](https://doc.rust-lang.org/nightly/cargo/reference/cargo-targets.html#the-crate-type-field)
-        // should be either handled earlier by `get_build_targets` or unsupported:
-        // - `bin` - handled via `BuildTargetKind::Binary` and
-        //   `BuildTargetId::Binary(_)`
-        // - `dylib` - currently not supported by `cargo_crate.gni`
-        // - `staticlib` - currently not supported by `cargo_crate.gni`.
-        // - `proc-macro` - handled via `BuildTargetKind::ProcMacro`
-        //
-        // TODO(lukasza): Should we proactively return `Rlib` for `staticlib`?
-        // Or do we want to wait until this is actually needed (to double-check
-        // that this will do the right thing)?
-        bail!("Unknown or unexpected crate types: {}", crate_types.join(", "));
+    /// Returns the selected output types in stable order.
+    pub(crate) fn artifact_types(&self) -> Vec<LibType> {
+        let mut types = self.output_types.clone();
+        types.sort();
+        types.dedup();
+        types
+    }
+
+    /// Validates that this instance selects at most one library output type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if declarations or dependencies select different types.
+    pub(crate) fn validate_output_types(&self) -> Result<()> {
+        if self.artifact_types().len() > 1 {
+            bail!(
+                "multiple crate types for one resolved instance are not supported; \
+                 all declarations and dependencies must select a single crate_type"
+            );
+        }
+        Ok(())
+    }
+
+    /// Returns the preferred output usable by a Rust dependency.
+    pub(crate) fn rust_type(&self) -> Option<LibType> {
+        let types = self.artifact_types();
+        [LibType::ProcMacro, LibType::Rlib, LibType::Dylib]
+            .into_iter()
+            .find(|kind| types.contains(kind))
+    }
+
+    /// Returns `proc-macro` for procedural macros and `rlib` otherwise.
+    pub(crate) fn default_type(&self) -> LibType {
+        if self.is_proc_macro {
+            LibType::ProcMacro
+        } else {
+            LibType::Rlib
+        }
     }
 }
 
@@ -240,6 +258,7 @@ impl std::fmt::Display for LibType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             Self::Rlib => f.write_str("rlib"),
+            Self::Dylib => f.write_str("dylib"),
             Self::ProcMacro => f.write_str("proc-macro"),
         }
     }
@@ -577,7 +596,11 @@ pub(crate) struct BuildTargets {
 ///
 /// # Errors
 ///
-/// Returns an error if the library has an unsupported crate type.
+/// Returns an error if Cargo metadata has an unsupported library target kind.
+///
+/// # Panics
+///
+/// Panics on duplicate libraries or build scripts.
 pub(crate) fn get_build_targets(
     package: &PackageMetadata,
     extra_config: &BuildConfig,
@@ -596,14 +619,12 @@ pub(crate) fn get_build_targets(
             BuildTargetId::Library => {
                 let lib_type = match target.kind() {
                     BuildTargetKind::ProcMacro => LibType::ProcMacro,
-                    BuildTargetKind::LibraryOrExample(crate_types) => {
-                        LibType::from_crate_types(crate_types)?
-                    }
+                    BuildTargetKind::LibraryOrExample(_) => LibType::Rlib,
                     // Matching `BuildTargetId::Library` means that `BuildTargetKind::Binary`
                     // should be impossible.
                     BuildTargetKind::Binary => unreachable!(),
                     // `BuildTargetKind` is non-exhaustive.
-                    other => unimplemented!("Unrecognized `BuildTargetKind`: {other:?}"),
+                    other => bail!("Unrecognized `BuildTargetKind`: {other:?}"),
                 };
                 Some(TargetType::Lib(lib_type))
             }
@@ -636,7 +657,12 @@ pub(crate) fn get_build_targets(
                     target.name(),
                     package.name(),
                 );
-                lib_target = Some(LibTarget { root, lib_type });
+                lib_target = Some(LibTarget {
+                    root,
+                    name: target.name().to_owned(),
+                    is_proc_macro: lib_type == LibType::ProcMacro,
+                    output_types: Vec::new(),
+                });
             }
             _ => (),
         }
@@ -704,7 +730,7 @@ mod tests {
         assert!(dependencies[i].bin_targets.is_empty());
         assert!(dependencies[i].lib_target.as_ref().is_some_and(|lib_target| {
             assert!(lib_target.root.ends_with("tools/crates/gnrt/sample_package/bar/src/lib.rs"));
-            assert_eq!(lib_target.lib_type, LibType::Rlib);
+            assert_eq!(lib_target.default_type(), LibType::Rlib);
             true
         }));
         assert_eq!(
@@ -1213,6 +1239,33 @@ mod tests {
         assert_eq!(prost.dependencies[0].package_name, "anyhow");
         assert!(prost.dependencies[0].condition.is_always_true());
         assert!(prost.dependency_kinds[&DependencyKind::Normal].condition.is_always_true());
+    }
+
+    #[test]
+    fn library_outputs_follow_explicit_selection() {
+        let mut library = LibTarget {
+            root: "lib.rs".into(),
+            name: "native_api".to_owned(),
+            is_proc_macro: false,
+            output_types: Vec::new(),
+        };
+        assert_eq!(library.default_type(), LibType::Rlib);
+        assert!(library.validate_output_type(LibType::Rlib).is_ok());
+        assert!(library.validate_output_type(LibType::Dylib).is_ok());
+        assert!(library.validate_output_type(LibType::ProcMacro).is_err());
+        assert_eq!(library.rust_type(), None);
+        library.output_types.push(LibType::Rlib);
+        assert!(library.validate_output_types().is_ok());
+        library.output_types.push(LibType::Dylib);
+        assert!(library.validate_output_types().is_err());
+        library.output_types.pop();
+        assert_eq!(library.rust_type(), Some(LibType::Rlib));
+        assert_eq!(library.default_type(), LibType::Rlib);
+        library.is_proc_macro = true;
+        assert_eq!(library.default_type(), LibType::ProcMacro);
+        assert!(library.validate_output_type(LibType::Rlib).is_err());
+        assert!(library.validate_output_type(LibType::Dylib).is_err());
+        assert!(library.validate_output_type(LibType::ProcMacro).is_ok());
     }
 
     // `test_metadata4.json` contains the output of `cargo metadata` run in

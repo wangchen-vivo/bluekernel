@@ -13,25 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Run a Rust compiler with build.rs-provided environment variables.
-
-The GN rust toolchain routes every rustc/clippy invocation through this script:
-
-    python3 run_rustc.py <compiler> [compiler args...]
-
-`<compiler>` is the real driver (e.g. `rustc` or `clippy-driver`) and every
-remaining argument is forwarded to it unchanged.
-
-When `BUILD_SCRIPT_RUSTC_ENV_FILE` points at an environment file, the variables
-it defines are merged into the compiler environment, overriding inherited ones.
-The file holds one `[export ]KEY=VALUE` per line; blank lines and `#` comments
-are ignored and the value may be single- or double-quoted. This is how a crate's
-build script (cargo:rustc-env) reaches its own compilation without a per-target
-tool command.
-
-The compiler replaces this process via exec, so its exit status and signals are
-preserved.
-"""
+"""Run rustc/Clippy with GN artifact bindings and build.rs environment values."""
 
 import os
 import sys

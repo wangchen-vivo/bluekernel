@@ -14,7 +14,7 @@ the editable inputs. Generate vendored sources and GN rules with `gnrt sync`.
 | Task | Reference |
 | --- | --- |
 | CLI options, every configuration field, defaults, path bases, and environment | [Configuration](references/configuration.md) |
-| Add or update a crate, use macros, select board features, or isolate features | [Dependency workflows](references/dependencies.md) |
+| Add or update a crate, select library outputs, use macros, select board features, or isolate features | [Dependency workflows](references/dependencies.md) |
 | Capture local adaptations, register patches, or validate patch application | [Source patches](references/patches.md) |
 | Diagnose collection, Cargo, patch, state, compiler, or linker failures | [Troubleshooting](references/troubleshooting.md) |
 
@@ -59,8 +59,9 @@ ninja -C out/qemu_mps3_an547.release.swi bin/ftp_client_example
 ```
 
 Select validation for the actual change. `--check` does not compile or link.
-A `cargo_spec` label is a proxy, so building that label alone may perform no
-compilation. Build a generated crate target or a product that uses it.
+A `cargo_spec` label declares dependencies without compiling them. `build_rust`
+resolves it to the selected artifact. Build a product that uses it to validate
+dependency binding and final linking as well.
 
 ## Preserve Project Boundaries
 
@@ -71,6 +72,7 @@ compilation. Build a generated crate target or a product that uses it.
   explicitly requested. Update their references to migrated vendor dependencies
   when necessary.
 - Keep normal dependencies in `deps` and procedural macros in `proc_macro_deps`.
+  Declare procedural macro crates with `crate_type = "proc-macro"`.
   Preserve build dependencies and host/target feature separation.
 - Finish synchronization before starting consumers; avoid syncing while a build
   is using the same vendor tree. Publication recovery does not roll back every

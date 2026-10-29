@@ -19,88 +19,328 @@
 
 import("//build/templates/rust.gni")
 
-template("cargo_crate") {
-  if (defined(invoker.context)) {
-    assert(invoker.context == "target" || invoker.context == "host",
-           "context must be target or host")
-  }
+template("cargo_build_script") {
+  not_needed(invoker, "*")
   _crate_target_name = target_name
-  crate_name = target_name
-
-  if (defined(invoker.crate_name)) {
-    crate_name = invoker.crate_name
-  }
-
-  rustc_metadata = ""
-  if (defined(invoker.rustc_metadata)) {
-    rustc_metadata = invoker.rustc_metadata
-  } else if (defined(invoker.version)) {
-    rustc_metadata = "${crate_name}-${invoker.version}"
-  } else if (defined(invoker.epoch)) {
-    rustc_metadata = "${crate_name}-${invoker.epoch}"
-  }
-
   _epochlabel = "vunknown"
+  if (defined(invoker.epoch)) {
+    _epochlabel = "v" + invoker.epoch
+  }
+  _rustenv = []
+  if (defined(invoker.rustenv)) {
+    _rustenv = invoker.rustenv
+  }
+
+  if (defined(invoker.cargo_pkg_version)) {
+    _rustenv += [ "CARGO_PKG_VERSION=${invoker.cargo_pkg_version}" ]
+
+    # Parse `<major>.<minor>.<patch>-<pre>` (the `-<pre>` part of optional,
+    # other parts are mandatory).
+    _cargo_pkg_version_parts = string_split(invoker.cargo_pkg_version, ".")
+    _rustenv += [ "CARGO_PKG_VERSION_MAJOR=${_cargo_pkg_version_parts[0]}" ]
+    _rustenv += [ "CARGO_PKG_VERSION_MINOR=${_cargo_pkg_version_parts[1]}" ]
+    _cargo_pkg_version_subparts = string_split(_cargo_pkg_version_parts[2], "-")
+    _cargo_pkg_version_subparts += [ "" ]  # In case there is no prerelease.
+    _rustenv += [ "CARGO_PKG_VERSION_PATCH=${_cargo_pkg_version_subparts[0]}" ]
+    _rustenv += [ "CARGO_PKG_VERSION_PRE=${_cargo_pkg_version_subparts[1]}" ]
+  }
+  if (defined(invoker.cargo_pkg_name)) {
+    _rustenv += [ "CARGO_PKG_NAME=${invoker.cargo_pkg_name}" ]
+  }
+  if (defined(invoker.cargo_pkg_repository)) {
+    _rustenv += [ "CARGO_PKG_REPOSITORY=${invoker.cargo_pkg_repository}" ]
+  }
+
+  # Build scripts run with the crate root as cwd via CARGO_MANIFEST_DIR.
+  # Generated BUILD.gn files pass it in rustenv; hand-written ones
+  # fall back to this directory.
+  if (defined(invoker.build_root) &&
+      filter_include(_rustenv, [ "CARGO_MANIFEST_DIR=*" ]) == []) {
+    _rustenv += [ "CARGO_MANIFEST_DIR=" + rebase_path(".", root_build_dir) ]
+  }
+
+  # This name includes the target name to ensure it's unique for each possible
+  # build target in the same BUILD.gn file.
+  # Normalize the full label for use in generated build-script target names.
+  # For example, //external/vendor/serde-1.0.228:serde becomes
+  # __external_vendor_serde_1_0_228_serde.
+  _instance =
+      string_replace(get_label_info(":" + target_name, "label_no_toolchain"),
+                     "/",
+                     "_")
+  _instance = string_replace(_instance, ":", "_")
+  _instance = string_replace(_instance, ".", "_")
+  _instance = string_replace(_instance, "-", "_")
+  _instance = string_replace(_instance, "+", "_")
+  _build_script_prefix = "${_instance}_build_script"
+  _build_script_variant = "target"
+
+  # The parent crate's resolution context applies even though build.rs runs on
+  # the host.
+  if (defined(invoker.context)) {
+    _build_script_variant = invoker.context
+  } else if ((current_toolchain == "//build/toolchain:host" &&
+              default_toolchain != "//build/toolchain:host") ||
+             (defined(invoker.crate_type) &&
+              invoker.crate_type == "proc-macro")) {
+    _build_script_variant = "host"
+  }
+  build_script_name = "${_build_script_prefix}_${_build_script_variant}"
+
+  # cargo:rustc-link-search paths are not recorded in rlib metadata, so
+  # dependents must repeat them when linking the final binary, matching
+  # how Cargo passes -L on every downstream unit.
   if (defined(invoker.version)) {
-    _tempver = string_replace(invoker.version, ".", "_")
-    _epochlabel = "v${_tempver}"
-  } else if (defined(invoker.epoch)) {
-    _tempepoch = string_replace(invoker.epoch, ".", "_")
-    _epochlabel = "v${_tempepoch}"
+    _build_script_out_dir =
+        "${target_out_dir}/${target_name}-${invoker.version}_out"
+  } else {
+    _build_script_out_dir =
+        "${target_out_dir}/${target_name}-${_epochlabel}_out"
   }
 
-  not_needed([
-               "_epochlabel",
-               "_crate_target_name",
-             ])
+  not_needed([ "_epochlabel" ])
 
-  # Executables need to have unique names. Work out a prefix.
-  if (defined(invoker.build_root)) {
-    # This name includes the target name to ensure it's unique for each possible
-    # build target in the same BUILD.gn file.
-    # Normalize the full label for use in generated build-script target names.
-    # For example, //external/vendor/serde-1.0.228:serde becomes
-    # __external_vendor_serde_1_0_228_serde.
-    _instance =
-        string_replace(get_label_info(":" + target_name, "label_no_toolchain"),
-                       "/",
-                       "_")
-    _instance = string_replace(_instance, ":", "_")
-    _instance = string_replace(_instance, ".", "_")
-    _instance = string_replace(_instance, "-", "_")
-    _instance = string_replace(_instance, "+", "_")
-    _build_script_prefix = "${_instance}_build_script"
-    _build_script_variant = "target"
-
-    # The parent crate's resolution context applies even though build.rs runs on
-    # the host.
-    if (defined(invoker.context)) {
-      _build_script_variant = invoker.context
-    } else if ((current_toolchain == "//build/toolchain:host" &&
-                default_toolchain != "//build/toolchain:host") ||
-               (defined(invoker.crate_type) &&
-                invoker.crate_type == "proc-macro")) {
-      _build_script_variant = "host"
-    }
-    build_script_name = "${_build_script_prefix}_${_build_script_variant}"
-
-    # cargo:rustc-link-search paths are not recorded in rlib metadata, so
-    # dependents must repeat them when linking the final binary, matching
-    # how Cargo passes -L on every downstream unit.
-    if (defined(invoker.version)) {
-      _build_script_out_dir =
-          "${target_out_dir}/${target_name}-${invoker.version}_out"
+  action("${build_script_name}_output") {
+    script = rebase_path("//build/scripts/run_build_script.py")
+    build_script_target = ":${build_script_name}(//build/toolchain:host)"
+    deps = [ build_script_target ]
+    build_script = get_label_info(build_script_target, "root_out_dir") +
+                   "/bin/${build_script_name}"
+    flags_file = "$target_out_dir/${_crate_target_name}.cargo_flags.rsp"
+    rustc_env_file =
+        "$target_out_dir/${_crate_target_name}.build_script_rustc_env.env"
+    if (_build_script_variant == "host") {
+      _build_script_ctx = host_build_ctx
     } else {
-      _build_script_out_dir =
-          "${target_out_dir}/${target_name}-${_epochlabel}_out"
+      _build_script_ctx = build_ctx
+    }
+    _native_context = {
+      version = 1
+      host = {
+        triple = host_build_ctx.toolchain_target_triple
+        cc = host_build_ctx.toolchain_cc
+        cxx = host_build_ctx.toolchain_cxx
+        ar = host_build_ctx.toolchain_ar
+        cflags = host_build_ctx.build_config_cflags +
+                 host_build_ctx.build_config_cflags_c
+        cxxflags = host_build_ctx.build_config_cflags +
+                   host_build_ctx.build_config_cflags_cc
+        arflags = host_build_ctx.toolchain_arflags
+      }
+      target = {
+        triple = _build_script_ctx.toolchain_target_triple
+        cc = _build_script_ctx.toolchain_cc
+        cxx = _build_script_ctx.toolchain_cxx
+        ar = _build_script_ctx.toolchain_ar
+        cflags = _build_script_ctx.build_config_cflags +
+                 _build_script_ctx.build_config_cflags_c
+        cxxflags = _build_script_ctx.build_config_cflags +
+                   _build_script_ctx.build_config_cflags_cc
+        arflags = _build_script_ctx.toolchain_arflags
+      }
+    }
+    _native_context_file =
+        "${target_gen_dir}/${_crate_target_name}.native_context.json"
+    write_file(_native_context_file, _native_context, "json")
+    inputs = [
+      _native_context_file,
+      "//build/scripts/action_helpers.py",
+    ]
+    args = [
+      "--build-script",
+      rebase_path(build_script, root_build_dir),
+      "--rustc-flags-file",
+      rebase_path(flags_file),
+      "--rustc-env-file",
+      rebase_path(rustc_env_file, root_build_dir),
+      "--host",
+      host_build_ctx.toolchain_target_triple,
+      "--rustc",
+      host_build_ctx.toolchain_rustc,
+      "--native-context-file",
+      rebase_path(_native_context_file, root_build_dir),
+
+      # TARGET describes the platform of the crate built by this script.
+      "--target",
+      _build_script_ctx.toolchain_target_triple,
+      "--profile",
+      _build_script_ctx.build_config_rust_profile,
+      "--out-dir",
+      rebase_path(_build_script_out_dir, root_build_dir),
+    ]
+    args += [ "--cfgs" ] + _build_script_ctx.toolchain_cfgs
+
+    # Preserve the rustc flag order: crate, board, then profile.
+    _build_script_rustflags = []
+    if (defined(invoker.rustflags)) {
+      _build_script_rustflags += invoker.rustflags
+    }
+    if (defined(board_rustflags)) {
+      _build_script_rustflags += board_rustflags
+    }
+    _build_script_rustflags += _build_script_ctx.build_config_rustflags
+    foreach(_flag, _build_script_rustflags) {
+      args += [ "--rustflag=$_flag" ]
     }
 
-    config("${target_name}_native_libs") {
-      rustflags =
-          [ "-Lnative=" + rebase_path(_build_script_out_dir, root_build_dir) ]
+    _script_env = _rustenv
+    if (defined(invoker.build_script_rustenv)) {
+      _script_env += invoker.build_script_rustenv
+    }
+    if (_script_env != []) {
+      args += [ "--env" ]
+      args += _script_env
+    }
+
+    outputs = [
+      flags_file,
+      rustc_env_file,
+    ]
+
+    if (defined(invoker.build_script_outputs)) {
+      foreach(output, invoker.build_script_outputs) {
+        # Update the stamp mtime after the build script succeeds.
+        if (get_path_info(output, "extension") == "stamp") {
+          outputs += [ "$target_out_dir/${_crate_target_name}.$output" ]
+          args += [
+            "--stamp-file",
+            rebase_path("$target_out_dir/${_crate_target_name}.$output",
+                        root_build_dir),
+          ]
+        } else {
+          outputs += [ "${_build_script_out_dir}/$output" ]
+        }
+      }
+    }
+
+    if (defined(invoker.build_script_inputs)) {
+      inputs += invoker.build_script_inputs
     }
   }
 
+  # A crate used in both Cargo dependencies and build-dependencies may have
+  # different features and build-dependencies in each graph. "target" serves
+  # normal dependencies; "host" serves build-dependencies and proc-macros.
+  # Both build-script executables are compiled and run on the host.
+  if (current_toolchain == "//build/toolchain:host") {
+    _variants = [
+      "target",
+      "host",
+    ]
+    if (defined(invoker.context)) {
+      _variants = []
+      _variants += [ invoker.context ]
+    }
+    foreach(_variant, _variants) {
+      build_rust("${_build_script_prefix}_${_variant}") {
+        sources = invoker.build_sources
+        crate_type = "bin"
+        rustc_metadata = "${_build_script_prefix}_${_variant}"
+        if (_variant == "target" && defined(invoker.build_script_target_deps)) {
+          build_deps = invoker.build_script_target_deps
+        } else if (_variant == "host" &&
+                   defined(invoker.build_script_host_deps)) {
+          build_deps = invoker.build_script_host_deps
+        } else if (defined(invoker.build_deps)) {
+          build_deps = invoker.build_deps
+        }
+        if (defined(invoker.build_script_aliased_deps)) {
+          aliased_deps = invoker.build_script_aliased_deps
+        }
+        rustenv = _rustenv
+        forward_variables_from(invoker,
+                               [
+                                 "crate_name",
+                                 "edition",
+                                 "rustflags",
+                               ])
+        if (defined(invoker.build_script_features)) {
+          features = invoker.build_script_features
+        } else if (_variant == "target" &&
+                   defined(invoker.build_script_target_features)) {
+          features = invoker.build_script_target_features
+        } else if (_variant == "host" &&
+                   defined(invoker.build_script_host_features)) {
+          features = invoker.build_script_host_features
+        } else if (defined(invoker.features)) {
+          features = invoker.features
+        }
+      }
+    }
+  }
+}
+
+template("cargo_crate") {
+  _owner = target_name
+  if (defined(invoker.build_script)) {
+    _owner = get_label_info(invoker.build_script, "name")
+  }
+  _has_script = defined(invoker.build_script) || defined(invoker.build_root)
+  if (defined(invoker.build_root) && !defined(invoker.build_script)) {
+    cargo_build_script(target_name) {
+      forward_variables_from(invoker, "*")
+    }
+  }
+  _script_dir = target_out_dir
+  if (defined(invoker.build_script)) {
+    _script_dir = get_label_info(invoker.build_script, "target_out_dir")
+  }
+  _kind = "rlib"
+  if (defined(invoker.crate_type)) {
+    _kind = invoker.crate_type
+  }
+  _epochlabel = "vunknown"
+  if (defined(invoker.epoch)) {
+    _epochlabel = "v" + string_replace(invoker.epoch, ".", "_")
+  }
+  _out_dir = "${_script_dir}/${_owner}-${_epochlabel}_out"
+  if (defined(invoker.version)) {
+    _out_dir = "${_script_dir}/${_owner}-${invoker.version}_out"
+  }
+  _script_prefix =
+      string_replace(get_label_info(":" + _owner, "label_no_toolchain"),
+                     "/",
+                     "_")
+  foreach(_character,
+          [
+            ":",
+            ".",
+            "-",
+            "+",
+          ]) {
+    _script_prefix = string_replace(_script_prefix, _character, "_")
+  }
+  _variant = "target"
+  if (defined(invoker.context)) {
+    _variant = invoker.context
+  } else if (_kind == "proc-macro" ||
+             (current_toolchain == "//build/toolchain:host" &&
+              default_toolchain != current_toolchain)) {
+    _variant = "host"
+  }
+  _script_action = ":${_script_prefix}_build_script_${_variant}_output"
+  if (_has_script) {
+    config("${target_name}_native_libs") {
+      rustflags = [ "-Lnative=" + rebase_path(_out_dir, root_build_dir) ]
+    }
+  }
+  _crate_name = target_name
+  if (defined(invoker.crate_name)) {
+    _crate_name = invoker.crate_name
+  }
+  not_needed([
+               "_crate_name",
+               "_out_dir",
+               "_script_action",
+             ])
+  if (_kind == "dylib") {
+    config("${target_name}_runtime_libs") {
+      rustflags = [
+        "-Crpath=yes",
+        "-Cprefer-dynamic",
+      ]
+    }
+  }
   _rustenv = []
   if (defined(invoker.rustenv)) {
     _rustenv = invoker.rustenv
@@ -139,6 +379,7 @@ template("cargo_crate") {
                            "*",
                            [
                              "context",
+                             "build_script",
                              "build_root",
                              "build_sources",
                              "build_deps",
@@ -151,233 +392,66 @@ template("cargo_crate") {
                              "build_script_host_deps",
                              "build_script_inputs",
                              "build_script_outputs",
-                             "rustenv",
                              "version",
                              "epoch",
+                             "rustenv",
+                             "cargo_pkg_version",
+                             "cargo_pkg_name",
+                             "cargo_pkg_repository",
                            ])
+    crate_type = _kind
+    if (!defined(all_dependent_configs)) {
+      all_dependent_configs = []
+    }
+    if (_kind == "dylib") {
+      all_dependent_configs += [ ":${target_name}_runtime_libs" ]
+    }
     rustenv = _rustenv
     if (!defined(rustflags)) {
       rustflags = []
     }
-
-    crate_type = "rlib"
-    if (defined(invoker.crate_type)) {
-      crate_type = invoker.crate_type
+    if (!defined(rustc_metadata)) {
+      if (defined(invoker.version)) {
+        rustc_metadata = "${_crate_name}-${invoker.version}"
+      } else if (defined(invoker.epoch)) {
+        rustc_metadata = "${_crate_name}-${invoker.epoch}"
+      }
     }
-
-    if (defined(invoker.build_root)) {
+    if (_has_script) {
       if (!defined(deps)) {
         deps = []
-      }
-      if (!defined(sources)) {
-        sources = []
       }
       if (!defined(inputs)) {
         inputs = []
       }
-
-      flags_file = "${target_out_dir}/${_crate_target_name}.cargo_flags.rsp"
-
-      all_dependent_configs = [ ":${target_name}_native_libs" ]
-
-      rustflags += [ "@" + rebase_path(flags_file, root_build_dir) ]
-      rustflags += [
-        "-L",
-        "native=" + rebase_path(target_out_dir, root_build_dir),
+      _flags = "${_script_dir}/${_owner}.cargo_flags.rsp"
+      _env = "${_script_dir}/${_owner}.build_script_rustc_env.env"
+      inputs += [
+        _flags,
+        _env,
       ]
-      inputs += [ flags_file ]
-
-      # Environment exported by this crate's build script (cargo:rustc-env).
-      # run_rustc.py reads it through BUILD_SCRIPT_RUSTC_ENV_FILE.
-      rustc_env_file =
-          "$target_out_dir/${_crate_target_name}.build_script_rustc_env.env"
-      inputs += [ rustc_env_file ]
-      rustenv += [ "BUILD_SCRIPT_RUSTC_ENV_FILE=" +
-                   rebase_path(rustc_env_file, root_build_dir) ]
-
-      # build.rs writes into this directory and the main crate compiles with
-      # the same OUT_DIR.
-      rustenv += [ "OUT_DIR=" + rebase_path(_build_script_out_dir) ]
-
+      rustflags += [ "@" + rebase_path(_flags, root_build_dir) ]
+      rustenv += [
+        "BUILD_SCRIPT_RUSTC_ENV_FILE=" + rebase_path(_env, root_build_dir),
+        "OUT_DIR=" + rebase_path(_out_dir),
+      ]
       if (defined(invoker.build_script_outputs)) {
-        # Track generated files and the stamp, whose mtime changes on every run.
-        foreach(output, invoker.build_script_outputs) {
-          if (get_path_info(output, "extension") == "stamp") {
-            inputs += [ "$target_out_dir/${_crate_target_name}.$output" ]
+        foreach(_output, invoker.build_script_outputs) {
+          if (get_path_info(_output, "extension") == "stamp") {
+            inputs += [ "${_script_dir}/${_owner}.${_output}" ]
           } else {
-            inputs += [ "${_build_script_out_dir}/$output" ]
+            inputs += [ "${_out_dir}/${_output}" ]
           }
         }
       }
-      deps += [ ":${build_script_name}_output" ]
-    }
-  }
-
-  if (defined(invoker.build_root)) {
-    action("${build_script_name}_output") {
-      script = rebase_path("//build/scripts/run_build_script.py")
-      build_script_target = ":${build_script_name}(//build/toolchain:host)"
-      deps = [ build_script_target ]
-      build_script = get_label_info(build_script_target, "root_out_dir") +
-                     "/bin/${build_script_name}"
-      flags_file = "$target_out_dir/${_crate_target_name}.cargo_flags.rsp"
-      rustc_env_file =
-          "$target_out_dir/${_crate_target_name}.build_script_rustc_env.env"
-      if (_build_script_variant == "host") {
-        _build_script_ctx = host_build_ctx
-      } else {
-        _build_script_ctx = build_ctx
+      if (!defined(public_deps)) {
+        public_deps = []
       }
-      _native_context = {
-        version = 1
-        host = {
-          triple = host_build_ctx.toolchain_target_triple
-          cc = host_build_ctx.toolchain_cc
-          cxx = host_build_ctx.toolchain_cxx
-          ar = host_build_ctx.toolchain_ar
-          cflags = host_build_ctx.build_config_cflags +
-                   host_build_ctx.build_config_cflags_c
-          cxxflags = host_build_ctx.build_config_cflags +
-                     host_build_ctx.build_config_cflags_cc
-          arflags = host_build_ctx.toolchain_arflags
-        }
-        target = {
-          triple = _build_script_ctx.toolchain_target_triple
-          cc = _build_script_ctx.toolchain_cc
-          cxx = _build_script_ctx.toolchain_cxx
-          ar = _build_script_ctx.toolchain_ar
-          cflags = _build_script_ctx.build_config_cflags +
-                   _build_script_ctx.build_config_cflags_c
-          cxxflags = _build_script_ctx.build_config_cflags +
-                     _build_script_ctx.build_config_cflags_cc
-          arflags = _build_script_ctx.toolchain_arflags
-        }
+      public_deps += [ _script_action ]
+      if (!defined(all_dependent_configs)) {
+        all_dependent_configs = []
       }
-      _native_context_file =
-          "${target_gen_dir}/${_crate_target_name}.native_context.json"
-      write_file(_native_context_file, _native_context, "json")
-      inputs = [ _native_context_file ]
-      args = [
-        "--build-script",
-        rebase_path(build_script, root_build_dir),
-        "--rustc-flags-file",
-        rebase_path(flags_file),
-        "--rustc-env-file",
-        rebase_path(rustc_env_file, root_build_dir),
-        "--host",
-        host_build_ctx.toolchain_target_triple,
-        "--rustc",
-        host_build_ctx.toolchain_rustc,
-        "--native-context-file",
-        rebase_path(_native_context_file, root_build_dir),
-
-        # TARGET describes the platform of the crate built by this script.
-        "--target",
-        _build_script_ctx.toolchain_target_triple,
-        "--profile",
-        _build_script_ctx.build_config_rust_profile,
-        "--out-dir",
-        rebase_path(_build_script_out_dir, root_build_dir),
-      ]
-      args += [ "--cfgs" ] + _build_script_ctx.toolchain_cfgs
-
-      # Preserve the rustc flag order: crate, board, then profile.
-      _build_script_rustflags = []
-      if (defined(invoker.rustflags)) {
-        _build_script_rustflags += invoker.rustflags
-      }
-      if (defined(board_rustflags)) {
-        _build_script_rustflags += board_rustflags
-      }
-      _build_script_rustflags += _build_script_ctx.build_config_rustflags
-      foreach(_flag, _build_script_rustflags) {
-        args += [ "--rustflag=$_flag" ]
-      }
-
-      _script_env = _rustenv
-      if (defined(invoker.build_script_rustenv)) {
-        _script_env += invoker.build_script_rustenv
-      }
-      if (_script_env != []) {
-        args += [ "--env" ]
-        args += _script_env
-      }
-
-      outputs = [
-        flags_file,
-        rustc_env_file,
-      ]
-
-      if (defined(invoker.build_script_outputs)) {
-        foreach(output, invoker.build_script_outputs) {
-          # Update the stamp mtime after the build script succeeds.
-          if (get_path_info(output, "extension") == "stamp") {
-            outputs += [ "$target_out_dir/${_crate_target_name}.$output" ]
-            args += [
-              "--stamp-file",
-              rebase_path("$target_out_dir/${_crate_target_name}.$output",
-                          root_build_dir),
-            ]
-          } else {
-            outputs += [ "${_build_script_out_dir}/$output" ]
-          }
-        }
-      }
-
-      if (defined(invoker.build_script_inputs)) {
-        inputs += invoker.build_script_inputs
-      }
-    }
-
-    # A crate used in both Cargo dependencies and build-dependencies may have
-    # different features and build-dependencies in each graph. "target" serves
-    # normal dependencies; "host" serves build-dependencies and proc-macros.
-    # Both build-script executables are compiled and run on the host.
-    if (current_toolchain == "//build/toolchain:host") {
-      _variants = [
-        "target",
-        "host",
-      ]
-      if (defined(invoker.context)) {
-        _variants = []
-        _variants += [ invoker.context ]
-      }
-      foreach(_variant, _variants) {
-        build_rust("${_build_script_prefix}_${_variant}") {
-          sources = invoker.build_sources
-          crate_type = "bin"
-          rustc_metadata = "${_build_script_prefix}_${_variant}"
-          if (_variant == "target" &&
-              defined(invoker.build_script_target_deps)) {
-            build_deps = invoker.build_script_target_deps
-          } else if (_variant == "host" &&
-                     defined(invoker.build_script_host_deps)) {
-            build_deps = invoker.build_script_host_deps
-          } else if (defined(invoker.build_deps)) {
-            build_deps = invoker.build_deps
-          }
-          if (defined(invoker.build_script_aliased_deps)) {
-            aliased_deps = invoker.build_script_aliased_deps
-          }
-          rustenv = _rustenv
-          forward_variables_from(invoker,
-                                 [
-                                   "edition",
-                                   "rustflags",
-                                 ])
-          if (defined(invoker.build_script_features)) {
-            features = invoker.build_script_features
-          } else if (_variant == "target" &&
-                     defined(invoker.build_script_target_features)) {
-            features = invoker.build_script_target_features
-          } else if (_variant == "host" &&
-                     defined(invoker.build_script_host_features)) {
-            features = invoker.build_script_host_features
-          } else if (defined(invoker.features)) {
-            features = invoker.features
-          }
-        }
-      }
+      all_dependent_configs += [ ":${target_name}_native_libs" ]
     }
   }
 }

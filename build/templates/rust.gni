@@ -111,18 +111,20 @@ template("build_rust") {
     _alias_file = "$target_gen_dir/${target_name}.cargo_aliases.json"
     _alias_data = {
       aliases = invoker.aliased_deps
+
+      # Alias resolution pairs these labels with deps + public_deps by position.
       original_deps = []
       if (defined(invoker.deps)) {
         original_deps += invoker.deps
-      }
-      if (defined(invoker.public_deps)) {
-        original_deps += invoker.public_deps
       }
       if (defined(invoker.build_deps)) {
         original_deps += invoker.build_deps
       }
       if (defined(invoker.proc_macro_deps)) {
         original_deps += invoker.proc_macro_deps
+      }
+      if (defined(invoker.public_deps)) {
+        original_deps += invoker.public_deps
       }
       resolved_deps = deps + public_deps
       directory = get_label_info(":" + target_name, "dir")
@@ -210,41 +212,34 @@ template("build_rust") {
   } else {
     inputs = []
   }
+  inputs += [ "//build/scripts/run_rustc.py" ]
 
   if (defined(invoker.linker_script)) {
     rustflags += [ "-Clink-arg=-Wl,-T" + rebase_path(invoker.linker_script) ]
     inputs += [ invoker.linker_script ]
   }
 
-  if (defined(invoker.crate_type) && invoker.crate_type == "proc-macro") {
-    rust_proc_macro(target_name) {
-      configs = []
-      if (defined(invoker.configs)) {
-        configs += invoker.configs
-      }
-      public_configs = []
-      if (defined(invoker.public_configs)) {
-        public_configs += invoker.public_configs
-      }
-      all_dependent_configs = []
-      if (defined(invoker.all_dependent_configs)) {
-        all_dependent_configs += invoker.all_dependent_configs
-      }
+  _target_type = "rust_library"
+  if (defined(invoker.crate_type)) {
+    if (invoker.crate_type == "proc-macro") {
+      _target_type = "rust_proc_macro"
+    } else if (invoker.crate_type == "dylib") {
+      _target_type = "shared_library"
     }
-  } else {
-    rust_library(target_name) {
-      configs = []
-      if (defined(invoker.configs)) {
-        configs += invoker.configs
-      }
-      public_configs = []
-      if (defined(invoker.public_configs)) {
-        public_configs += invoker.public_configs
-      }
-      all_dependent_configs = []
-      if (defined(invoker.all_dependent_configs)) {
-        all_dependent_configs += invoker.all_dependent_configs
-      }
+  }
+
+  target(_target_type, target_name) {
+    configs = []
+    if (defined(invoker.configs)) {
+      configs += invoker.configs
+    }
+    public_configs = []
+    if (defined(invoker.public_configs)) {
+      public_configs += invoker.public_configs
+    }
+    all_dependent_configs = []
+    if (defined(invoker.all_dependent_configs)) {
+      all_dependent_configs += invoker.all_dependent_configs
     }
   }
 }

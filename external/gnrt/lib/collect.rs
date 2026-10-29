@@ -24,6 +24,7 @@
 //! `declarations.json`.
 
 use crate::config::BuildConfig;
+use crate::deps::LibType;
 use crate::sync_context::SyncContext;
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -69,6 +70,9 @@ pub struct CrateDeclaration {
 
     /// The requested package version or version requirement.
     pub version: String,
+
+    /// The library output selected by the GN declaration template.
+    pub crate_type: LibType,
 
     /// Whether Cargo default features are enabled.
     pub default_features: bool,
@@ -1104,6 +1108,11 @@ fn declaration_from_scope(scope: Scope) -> Result<Declaration> {
             label: as_string(scope_get(&scope, "label")?)?,
             package: as_string(scope_get(&scope, "package")?)?,
             version: as_string(scope_get(&scope, "version")?)?,
+            crate_type: serde_json::from_value(serde_json::Value::String(as_string(scope_get(
+                &scope,
+                "crate_type",
+            )?)?))
+            .context("invalid cargo_spec crate_type")?,
             features: as_configurable_list(scope_get(&scope, "features")?)?,
             rustflags: match scope_get_opt(&scope, "rustflags") {
                 Some(value) => as_configurable_list(value)?,
@@ -1352,6 +1361,7 @@ mod tests {
             "}",
             "",
             "{",
+            "  crate_type = \"rlib\"",
             "  default_features = true",
             "  features = [\"derive\", \"quo\\\"te\\\\\"]",
             "  label = \"//test:test_crate\"",
@@ -1401,6 +1411,45 @@ mod tests {
             vec!["derive", "quo\"te\\"]
         );
         assert!(crate_.default_features);
+    }
+
+    #[test]
+    fn crate_types_require_gn_metadata_and_reject_unsupported_outputs() {
+        let declarations = parse_gn_meta_output(&sample_meta_output()).unwrap();
+        let Declaration::Crate(declaration) = &declarations.cargo[0] else {
+            unreachable!()
+        };
+        assert_eq!(declaration.crate_type, LibType::Rlib);
+        let missing = sample_meta_output().replace("  crate_type = \"rlib\"\n", "");
+        assert!(parse_gn_meta_output(&missing).is_err());
+        let mut missing = serde_json::to_value(declaration).unwrap();
+        missing.as_object_mut().unwrap().remove("crate_type");
+        assert!(serde_json::from_value::<CrateDeclaration>(missing).is_err());
+        for (name, expected) in [
+            ("rlib", LibType::Rlib),
+            ("dylib", LibType::Dylib),
+            ("proc-macro", LibType::ProcMacro),
+        ] {
+            let output = sample_meta_output().replace(
+                "  crate_type = \"rlib\"",
+                &format!("  crate_type = {name:?}"),
+            );
+            let declarations = parse_gn_meta_output(&output).unwrap();
+            let Declaration::Crate(declaration) = &declarations.cargo[0] else {
+                unreachable!()
+            };
+            assert_eq!(declaration.crate_type, expected);
+        }
+        for name in ["cdylib", "staticlib"] {
+            let output = sample_meta_output().replace(
+                "  crate_type = \"rlib\"",
+                &format!("  crate_type = {name:?}"),
+            );
+            assert!(parse_gn_meta_output(&output).is_err());
+            let mut json = serde_json::to_value(declaration).unwrap();
+            json["crate_type"] = serde_json::json!(name);
+            assert!(serde_json::from_value::<CrateDeclaration>(json).is_err());
+        }
     }
 
     #[test]
@@ -1626,6 +1675,7 @@ mod tests {
     fn parse_crate_with_git_source() {
         let crate_block = [
             "{",
+            "  crate_type = \"rlib\"",
             "  default_features = false",
             "  features = []",
             "  git = \"https://github.com/mattnenterprise/rust-ftp\"",
@@ -1660,6 +1710,7 @@ mod tests {
     fn parse_rejects_duplicate_label() {
         let crate_block = [
             "{",
+            "  crate_type = \"rlib\"",
             "  default_features = true",
             "  features = [\"derive\", \"quo\\\"te\\\\\"]",
             "  label = \"//test:test_crate\"",
@@ -1759,6 +1810,7 @@ mod tests {
             label = "//catalog:unreferenced"
             package = "{}"
             version = "{}"
+            crate_type = "rlib"
             features = []
             default_features = true
             git = ""

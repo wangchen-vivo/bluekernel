@@ -792,6 +792,7 @@ mod tests {
             let declaration: CrateDeclaration = serde_json::from_value(serde_json::json!({
                 "origin":"cargo", "label":format!("//test:{label}"), "package":package,
                 "version":"=1.0.0", "features":[feature], "default_features":false,
+                "crate_type":"rlib",
                 "git":"", "rev":"", "branch":"", "tag":"", "patches":[]
             }))
             .unwrap();

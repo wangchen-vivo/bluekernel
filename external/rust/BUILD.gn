@@ -44,6 +44,7 @@ cargo_spec("const-default") {
 
 cargo_spec("delegate") {
   package = "delegate"
+  crate_type = "proc-macro"
   version = "=0.13.4"
   default_features = false
 }
@@ -135,6 +136,7 @@ cargo_spec("zerocopy") {
 # Proc macros
 cargo_spec("num-derive") {
   package = "num-derive"
+  crate_type = "proc-macro"
   version = "=0.4.2"
   default_features = false
 }
@@ -149,6 +151,7 @@ cargo_spec("num-traits") {
 
 cargo_spec("paste") {
   package = "paste"
+  crate_type = "proc-macro"
   version = "=1.0.15"
   default_features = false
 }
@@ -163,6 +166,7 @@ cargo_spec("portable-atomic") {
 
 cargo_spec("serde_derive") {
   package = "serde_derive"
+  crate_type = "proc-macro"
   version = "=1.0.228"
   default_features = false
 }
@@ -276,6 +280,7 @@ cargo_spec("defmt-test") {
 cargo_spec("document-features") {
   patches = [ "//external/rust/patches/document-features-0.2.12/001-public-source-compat.patch" ]
   package = "document-features"
+  crate_type = "proc-macro"
   version = "=0.2.12"
   default_features = false
 }
@@ -332,6 +337,7 @@ cargo_spec("esp-hal") {
 
 cargo_spec("esp-hal-procmacros") {
   package = "esp-hal-procmacros"
+  crate_type = "proc-macro"
   version = "=0.22.0"
   default_features = false
 }
@@ -485,12 +491,14 @@ cargo_spec("pin-project-lite") {
 
 cargo_spec("indoc") {
   package = "indoc"
+  crate_type = "proc-macro"
   version = "=2.0.7"
   default_features = false
 }
 
 cargo_spec("instability") {
   package = "instability"
+  crate_type = "proc-macro"
   version = "=0.3.12"
   default_features = false
 }

@@ -63,6 +63,7 @@ The template is `build/templates/cargo.gni`; it is allowed under
 | Target name | Required GN template argument | Stable proxy name used by consumers, independent of the package name. |
 | `package` | Required | Cargo package name. |
 | `version` | Required | Cargo version requirement. Use `=1.2.3` for an exact version, not `==1.2.3`. |
+| `crate_type` | `"rlib"` | Select `rlib`, `dylib`, or `proc-macro`. Procedural macro crates must explicitly select `proc-macro`. |
 | `default_features` | `true` | Enable Cargo's default feature set. |
 | `features` | `[]` | Feature strings and conditional scopes. Cargo unions requests; generated GN restores their conditions. |
 | `rustflags` | `[]` | Ordered rustc arguments, optionally conditional. Conflicting requests for a shared instance require isolation. |
@@ -76,6 +77,13 @@ The template is `build/templates/cargo.gni`; it is allowed under
 Supply at most one of `rev`, `branch`, and `tag`, and only with `git`. Declarations
 for the same normalized package/version/Git source/ref must agree on patches.
 The shared vendor layout rejects different sources for one package name/version.
+
+The GN template supplies the `crate_type` default and always exports it in
+metadata. GNRT requires this field rather than supplying a declaration default.
+GNRT validates the declared type against Cargo metadata and reports mismatches
+without changing the declaration's output type.
+Each resolved instance supports one output type. Requests for both `rlib` and
+`dylib` in the same instance are rejected.
 
 Only `features` and `rustflags` accept conditional scopes:
 

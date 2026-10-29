@@ -45,14 +45,42 @@ Run `gnrt sync --all`, inspect changes to `external/rust/Cargo.lock`, run
 that version, default features, optional dependencies, and source identity match
 the requested change. Generated vendor files remain ignored.
 
+## Select a Library Output
+
+Use `crate_type` to select the library output. For a Rust dynamic library:
+
+```gn
+cargo_spec("codec_dynamic") {
+  package = "codec"
+  version = "=1.0.0"
+  crate_type = "dylib"
+}
+```
+
+Rust targets use `//external/rust:codec_dynamic` in `build_rust` dependencies.
+Omit `crate_type` or set it to `"rlib"` when a static Rust library is needed.
+The selected target must support dynamic linking when requesting `dylib`.
+
+The GN template defaults to `rlib`, including for packages whose manifests list
+other library outputs. Declare procedural macros with `crate_type = "proc-macro"`.
+GNRT reports incompatible declarations rather than selecting a different output
+type. This field selects a library output, not a binary target.
+
+Declarations share features within the same resolution instance, but must select
+the same output type. GNRT rejects requests for both `rlib` and `dylib` from one
+instance, including an `rlib` required by a transitive Rust dependency. Selecting
+`dylib` does not make transitive dependencies dynamic. Use feature isolation when
+independent feature sets are required.
+
 ## Procedural Macros and Build Scripts
 
-Declare a macro crate normally:
+Declare the procedural macro type explicitly:
 
 ```gn
 cargo_spec("paste") {
   package = "paste"
   version = "=1.0.15"
+  crate_type = "proc-macro"
   default_features = false
 }
 ```

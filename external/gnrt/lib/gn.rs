@@ -405,7 +405,7 @@ pub fn build_rule_from_dep(
                     (Some(normalized_crate_name.to_string()), Some(crate_epoch))
                 }
             };
-            let crate_type = lib_target.lib_type.to_string();
+            let crate_type = lib_target.default_type().to_string();
 
             let mut lib_detail = detail_template.clone();
             lib_detail.crate_name = crate_name;

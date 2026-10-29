@@ -46,7 +46,7 @@ if (gnrt_mode == "build") {
   assert(_gnrt_state_check.valid,
          _gnrt_state_check.reason + " " + _gnrt_state_check.sync_command)
   gnrt_crate_index = read_file(gnrt_crate_index_path, "json")
-  assert(gnrt_crate_index.version == 1,
+  assert(gnrt_crate_index.version == 2,
          "Unsupported crate index. Run gnrt sync.")
 } else {
   gnrt_crate_index = {
